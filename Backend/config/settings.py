@@ -73,13 +73,6 @@ REST_FRAMEWORK = {
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-# UserAccount is a custom AbstractBaseUser. It must be registered as the
-# project's auth user model so that simplejwt's JWTAuthentication resolves
-# request.user to a UserAccount instance (the model every permission, ledger,
-# and balance query in this codebase is written against). Without this, JWT
-# auth would fall back to django.contrib.auth.User and none of the credit /
-# scoped-role logic would line up with the authenticated principal.
 AUTH_USER_MODEL = "accounts.UserAccount"
 
 USE_TZ = True

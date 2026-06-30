@@ -116,11 +116,9 @@ class WorkspaceMembership(models.Model):
         db_table = "workspace_memberships"
         unique_together = [("user", "workspace")]
         indexes = [
-            # get_active_membership() and the plan-list eligibility step
-            # fetch a user's ACTIVE memberships -> (user, status).
+            # active memberships per user
             models.Index(fields=["user", "status"]),
-            # Admin/workspace-side roster queries filter by
-            # (workspace, status).
+            # roster per workspace
             models.Index(fields=["workspace", "status"]),
         ]
 
@@ -177,14 +175,11 @@ class CreditGrant(models.Model):
     class Meta:
         db_table = "credit_grants"
         indexes = [
-            # Balance computation sums a user's active grants -> (user,
-            # is_active) is the driving index for get_available_credit_balance.
+            # balance sum over a user's active grants
             models.Index(fields=["user", "is_active"]),
-            # Workspace-scoped top-up reporting filters by
-            # (workspace, is_active).
+            # workspace top-up reporting
             models.Index(fields=["workspace", "is_active"]),
-            # Expiry sweeps (a periodic job retiring grants) scan by
-            # expires_at.
+            # expiry sweeps
             models.Index(fields=["expires_at"]),
         ]
 
@@ -237,12 +232,9 @@ class ScopedRole(models.Model):
     class Meta:
         db_table = "scoped_roles"
         indexes = [
-            # get_scoped_role() looks up a role by
-            # (user, scope_object_type, scope_object_id) -- this composite
-            # serves the Layer-3 administrator check exactly.
+            # scoped-role lookup (admin check)
             models.Index(fields=["user", "scope_object_type", "scope_object_id"]),
-            # "who administers this workspace" queries filter by
-            # (workspace, role_type, is_active).
+            # admins of a workspace
             models.Index(fields=["workspace", "role_type", "is_active"]),
         ]
 

@@ -97,20 +97,11 @@ class Plan(models.Model):
     class Meta:
         db_table = "plans"
         indexes = [
-            # Hottest path: the public plan list filters on
-            # visibility + status (OPEN + ACTIVE) on every anonymous read.
-            # Composite serves that WHERE directly.
-            models.Index(
-                fields=["visibility", "status"],
-                name="plan_visibility_status_idx",
-            ),
-            # Workspace-scoped listing (WORKSPACE_ONLY plans for a member)
-            # and admin management both filter by workspace + status.
-            models.Index(
-                fields=["workspace", "status"],
-                name="plan_workspace_status_idx",
-            ),
-            # Supports the optional ?category= filter on the list endpoint.
+            # public list filter (visibility + status)
+            models.Index(fields=["visibility", "status"], name="plan_visibility_status_idx"),
+            # workspace listing / admin management
+            models.Index(fields=["workspace", "status"], name="plan_workspace_status_idx"),
+            # ?category= filter
             models.Index(fields=["category"], name="plan_category_idx"),
         ]
 
@@ -178,20 +169,11 @@ class Booking(models.Model):
         db_table = "bookings"
         unique_together = [("plan", "user")]
         indexes = [
-            # Capacity enforcement and the booking_count annotation both do
-            # COUNT(confirmed bookings) per plan. (plan, status) lets that
-            # count be served from the index without touching table rows.
-            models.Index(
-                fields=["plan", "status"], name="booking_plan_status_idx"
-            ),
-            # "My bookings" / per-user status lookups.
-            models.Index(
-                fields=["user", "status"], name="booking_user_status_idx"
-            ),
+            # capacity count / booking_count annotation (confirmed per plan)
+            models.Index(fields=["plan", "status"], name="booking_plan_status_idx"),
+            # per-user bookings
+            models.Index(fields=["user", "status"], name="booking_user_status_idx"),
         ]
-        # NOTE: unique_together already creates the (plan, user) index that
-        # backs the "already booked?" uniqueness check, so it is not
-        # duplicated above.
 
     def __str__(self):
         return f"{self.user.email} -> {self.plan.name} ({self.credits_consumed} credits)"
