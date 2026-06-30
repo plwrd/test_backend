@@ -116,8 +116,11 @@ class WorkspaceMembership(models.Model):
         db_table = "workspace_memberships"
         unique_together = [("user", "workspace")]
         indexes = [
-            # TODO: Candidate must justify every index they add here.
+            # get_active_membership() and the plan-list eligibility step
+            # fetch a user's ACTIVE memberships -> (user, status).
             models.Index(fields=["user", "status"]),
+            # Admin/workspace-side roster queries filter by
+            # (workspace, status).
             models.Index(fields=["workspace", "status"]),
         ]
 
@@ -174,9 +177,14 @@ class CreditGrant(models.Model):
     class Meta:
         db_table = "credit_grants"
         indexes = [
-            # TODO: Candidate must justify every index they add here.
+            # Balance computation sums a user's active grants -> (user,
+            # is_active) is the driving index for get_available_credit_balance.
             models.Index(fields=["user", "is_active"]),
+            # Workspace-scoped top-up reporting filters by
+            # (workspace, is_active).
             models.Index(fields=["workspace", "is_active"]),
+            # Expiry sweeps (a periodic job retiring grants) scan by
+            # expires_at.
             models.Index(fields=["expires_at"]),
         ]
 
@@ -229,8 +237,12 @@ class ScopedRole(models.Model):
     class Meta:
         db_table = "scoped_roles"
         indexes = [
-            # TODO: Candidate must justify every index they add here.
+            # get_scoped_role() looks up a role by
+            # (user, scope_object_type, scope_object_id) -- this composite
+            # serves the Layer-3 administrator check exactly.
             models.Index(fields=["user", "scope_object_type", "scope_object_id"]),
+            # "who administers this workspace" queries filter by
+            # (workspace, role_type, is_active).
             models.Index(fields=["workspace", "role_type", "is_active"]),
         ]
 

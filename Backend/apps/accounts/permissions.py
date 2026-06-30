@@ -39,9 +39,27 @@ AUTOMATIC FAIL CONDITIONS:
   to the workspace
 """
 
+from django.db.models import Sum, Q, Subquery, OuterRef, Value, IntegerField
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework.permissions import BasePermission
-from apps.accounts.models import CreditGrant, WorkspaceMembership, ScopedRole
+
+from apps.accounts.models import (
+    CreditGrant,
+    WorkspaceMembership,
+    ScopedRole,
+    UserAccount,
+)
+from apps.ledger.models import LedgerEntry
+
+
+def _active_grant_q(now):
+    """A grant only counts if it is active, not revoked, and not expired."""
+    return (
+        Q(is_active=True)
+        & Q(revoked_at__isnull=True)
+        & (Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+    )
 
 
 def get_available_credit_balance(user, workspace=None):
@@ -51,56 +69,110 @@ def get_available_credit_balance(user, workspace=None):
     Available balance = sum of active grant amounts minus sum of all
     LedgerEntry rows with entry_type=consumed for this user.
 
-    Check order:
+    Check / scope order:
     1. Platform subscription grants (source=subscription, workspace=None)
+       -- always in scope.
     2. Workspace top-up grants (source=topup, workspace=this workspace)
+       -- only in scope when a workspace is supplied.
 
-    TODO: Implement this function.
+    A top-up granted in workspace A must NEVER inflate the balance the user
+    can spend in workspace B. That is why top-ups are filtered by the exact
+    workspace and platform subscriptions (workspace=None) are the only
+    cross-workspace pool.
 
-    Requirements:
-    - Must only count grants where is_active=True
-    - Must only count grants where expires_at is null or in the future
-    - Must only count grants where revoked_at is null
-    - If workspace is provided, include workspace-scoped top-up grants
-      in addition to platform subscription grants
-    - Balance computation must join against LedgerEntry to derive
-      consumed amount. Never trust a mutable balance field.
-    - Must execute in a SINGLE database query -- no N+1
-    - Explain in a comment why your query structure avoids N+1
-    - Return 0 if no active grants exist
+    Consumption is read from the immutable ledger -- never from a mutable
+    field. Consumed ledger entries are stored with a NEGATIVE amount (see
+    LedgerEntry.amount help_text), so "granted minus consumed" is expressed
+    here as granted + sum(consumed_amounts).
+
+    NO N+1: both sums are correlated subqueries evaluated inside a SINGLE
+    SELECT against the one user row. The cost is constant regardless of how
+    many grants or ledger rows the user has -- there is no Python loop over
+    rows and no per-row query.
     """
-    raise NotImplementedError("TODO: implement get_available_credit_balance")
+    now = timezone.now()
+
+    grant_scope = Q(source=CreditGrant.Source.SUBSCRIPTION, workspace__isnull=True)
+    if workspace is not None:
+        grant_scope |= Q(source=CreditGrant.Source.TOPUP, workspace=workspace)
+
+    granted_sq = (
+        CreditGrant.objects
+        .filter(_active_grant_q(now), grant_scope, user_id=OuterRef("pk"))
+        .values("user_id")
+        .annotate(total=Sum("amount"))
+        .values("total")[:1]
+    )
+
+    consumed_sq = (
+        LedgerEntry.objects
+        .filter(subject_user_id=OuterRef("pk"), entry_type="consumed")
+        .values("subject_user_id")
+        .annotate(total=Sum("amount"))
+        .values("total")[:1]
+    )
+
+    row = (
+        UserAccount.objects
+        .filter(pk=user.pk)
+        .annotate(
+            granted=Coalesce(
+                Subquery(granted_sq, output_field=IntegerField()), Value(0)
+            ),
+            consumed=Coalesce(
+                Subquery(consumed_sq, output_field=IntegerField()), Value(0)
+            ),
+        )
+        .values("granted", "consumed")
+        .first()
+    )
+
+    if row is None:
+        return 0
+
+    # consumed amounts are negative, so this is granted - |consumed|.
+    balance = row["granted"] + row["consumed"]
+    return balance if balance > 0 else 0
 
 
 def get_active_membership(user, workspace):
     """
     Returns the user's active WorkspaceMembership for the given workspace,
-    or None if none exists.
-
-    TODO: Implement this function.
-
-    Requirements:
-    - status must be WorkspaceMembership.Status.ACTIVE
-    - expires_at must be null or in the future
-    - Must execute in exactly ONE database query
+    or None if none exists. Exactly ONE database query.
     """
-    raise NotImplementedError("TODO: implement get_active_membership")
+    now = timezone.now()
+    return (
+        WorkspaceMembership.objects
+        .filter(
+            user=user,
+            workspace=workspace,
+            status=WorkspaceMembership.Status.ACTIVE,
+        )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+        .first()
+    )
 
 
 def get_scoped_role(user, workspace, role_type, scope_object_type, scope_object_id):
     """
     Returns the user's active ScopedRole for a specific object, or None.
-
-    TODO: Implement this function.
-
-    Requirements:
-    - role_type must match exactly
-    - scope_object_type must match exactly
-    - scope_object_id must match exactly
-    - is_active must be True
-    - expires_at must be null or in the future
+    Exact match on role_type, scope_object_type, scope_object_id; must be
+    active and unexpired. One database query.
     """
-    raise NotImplementedError("TODO: implement get_scoped_role")
+    now = timezone.now()
+    return (
+        ScopedRole.objects
+        .filter(
+            user=user,
+            workspace=workspace,
+            role_type=role_type,
+            scope_object_type=scope_object_type,
+            scope_object_id=scope_object_id,
+            is_active=True,
+        )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+        .first()
+    )
 
 
 class HasSufficientCredits(BasePermission):
@@ -108,24 +180,43 @@ class HasSufficientCredits(BasePermission):
     Layer 2 permission class.
 
     Blocks the request if the user does not have a positive available
-    credit balance.
+    credit balance. (The exact "balance >= plan.credit_cost" check is a
+    per-action validation done inside the booking transaction, under a row
+    lock -- this class only enforces the coarse Layer-2 gate of "> 0".)
 
-    TODO: Implement has_permission.
-
-    Requirements:
-    - Use get_available_credit_balance()
-    - If balance is zero or less: return False with message
-      "Insufficient credit balance"
-    - The workspace context should be extracted from the request
-      if available
-    - Add a comment explaining how you determine the workspace context
-      from the request and why this matters for top-up grant scoping
+    Workspace context: for object-scoped endpoints (book / grant) the
+    relevant workspace is the workspace that OWNS the plan named in the URL.
+    We resolve it here so that workspace top-up grants are scoped correctly
+    -- a user whose only credits are a top-up in workspace X must not pass
+    Layer 2 for an action in workspace Y. If no plan_id is in the URL, we
+    fall back to platform-subscription scope only (workspace=None).
     """
 
     message = "Insufficient credit balance to perform this action."
 
     def has_permission(self, request, view):
-        raise NotImplementedError("TODO: implement HasSufficientCredits.has_permission")
+        if not request.user or not request.user.is_authenticated:
+            return False
+        workspace = self._resolve_workspace(view)
+        return get_available_credit_balance(request.user, workspace=workspace) > 0
+
+    def _resolve_workspace(self, view):
+        # Local import avoids any app-registry import-time coupling between
+        # the accounts and credits apps.
+        from apps.credits.models import Plan
+
+        plan_id = view.kwargs.get("plan_id")
+        if not plan_id:
+            return None
+        plan = (
+            Plan.objects.select_related("workspace").filter(pk=plan_id).first()
+        )
+        if plan is None:
+            return None
+        # Cache the resolved plan on the view so the view body does not have
+        # to re-query it.
+        view.resolved_plan = plan
+        return plan.workspace
 
 
 class IsWorkspaceAdministrator(BasePermission):
@@ -133,22 +224,24 @@ class IsWorkspaceAdministrator(BasePermission):
     Layer 3 permission class for administrator-only actions.
 
     Checks if the user has an active ScopedRole of type "administrator"
-    for the specific workspace being accessed.
+    scoped to the SPECIFIC workspace of the object being acted on.
 
-    TODO: Implement has_object_permission.
-
-    Requirements:
-    - Use get_scoped_role()
-    - scope_object_type = "workspace"
-    - scope_object_id = the workspace's pk
-    - Return False if no matching scoped role found
-    - Add a comment explaining why object-level permission is checked
-      here rather than at the queryset level
+    This is an OBJECT-level check (has_object_permission), not a queryset
+    filter, because authority here is per-object: being administrator of
+    workspace 12 grants nothing over workspace 13. The check must run
+    against the concrete plan instance, so the view must call
+    self.check_object_permissions(request, plan) explicitly (APIView does
+    not do object-permission checks automatically).
     """
 
     message = "You must be a workspace administrator to perform this action."
 
     def has_object_permission(self, request, view, obj):
-        raise NotImplementedError(
-            "TODO: implement IsWorkspaceAdministrator.has_object_permission"
+        role = get_scoped_role(
+            user=request.user,
+            workspace=obj.workspace,
+            role_type=ScopedRole.RoleType.ADMINISTRATOR,
+            scope_object_type="workspace",
+            scope_object_id=obj.workspace.pk,
         )
+        return role is not None

@@ -3,45 +3,59 @@ apps/credits/views.py
 
 Credits API views.
 
-THREE ENDPOINTS TO IMPLEMENT:
+THREE ENDPOINTS:
 
-1. GET  /api/plans/                -- PlanListView
-2. POST /api/plans/{id}/book/      -- PlanBookView
-3. PATCH /api/plans/{id}/grant/    -- PlanGrantView
+1. GET   /api/plans/                -- PlanListView
+2. POST  /api/plans/{id}/book/      -- PlanBookView
+3. PATCH /api/plans/{id}/grant/     -- PlanGrantView
 
-READ THE PERMISSION REQUIREMENTS CAREFULLY.
-Each endpoint has different permission requirements.
-Getting permissions wrong is an automatic fail.
-
-SERVICE MESH NOTE:
-TODO: Add a comment here explaining how inter-service communication
-works differently inside a Kuma service mesh compared to a direct HTTP
-environment. Specifically: how are service addresses resolved, what
-replaces hardcoded hostnames, and what does mTLS termination mean for
-your service code?
+SERVICE MESH NOTE (Kuma on Talos):
+Inside a Kuma service mesh, this service never dials another service by a
+hardcoded host:port. Each pod runs an Envoy sidecar; outbound calls go to a
+stable logical service name (e.g. "kafka.platform.svc" / a Kuma service tag),
+and Kuma's control plane resolves that name to a healthy backend instance and
+load-balances across them. Addresses are therefore discovered at runtime, not
+baked in -- which is exactly why every broker/DB/host in this project comes
+from environment variables, never a literal. mTLS is terminated at the
+sidecar: the sidecars negotiate and verify certificates for us, so our
+application code speaks plaintext to localhost (its own sidecar) and gets
+mutual TLS + identity on the wire for free. We do not manage certs in app
+code; we just trust the mesh boundary.
 """
 
 import logging
-from django.db import transaction
-from django.utils import timezone
-from django.core.cache import cache
+
+from django.db import transaction, IntegrityError
 from django.db.models import Count, Q
+from django.core.cache import cache
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.exceptions import (
+    ValidationError,
+    PermissionDenied,
+    APIException,
+)
 from rest_framework.permissions import IsAuthenticated, AllowAny
 
 from apps.credits.models import Plan, Booking
 from apps.credits.serializers import (
     PlanSerializer,
     BookingSerializer,
-    PlanStatusTransitionSerializer,
     CreditGrantSerializer,
 )
-from apps.credits.kafka_producer import publish_credit_consumed, publish_credit_granted
+from apps.credits.kafka_producer import (
+    publish_credit_consumed,
+    publish_credit_granted,
+)
+from apps.accounts.models import UserAccount, CreditGrant, WorkspaceMembership
 from apps.accounts.permissions import (
     HasSufficientCredits,
     IsWorkspaceAdministrator,
+    get_available_credit_balance,
+    get_active_membership,
 )
 from apps.ledger.models import LedgerEntry
 
@@ -51,137 +65,358 @@ PLANS_CACHE_KEY = "plans:public:list"
 PLANS_CACHE_TTL = 300  # 5 minutes
 
 
+class Conflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "Conflict with the current state of the resource."
+
+
+def invalidate_plans_cache():
+    """
+    Single, central invalidation point for the public plan cache.
+
+    Cache invalidation strategy: the public OPEN-plan list is cached under
+    one fixed key (PLANS_CACHE_KEY). Anything that can change which OPEN
+    plans exist or their status must call this to drop the key, so the next
+    public read recomputes and repopulates. We delete (not overwrite) so a
+    failed recompute never serves a half-built list. This is intentionally
+    coarse -- one key, blown away wholesale -- which is correct-by-default
+    and avoids the bookkeeping bugs of trying to surgically patch a cached
+    list.
+    """
+    cache.delete(PLANS_CACHE_KEY)
+
+
 class PlanListView(APIView):
     """
     GET /api/plans/
 
-    Returns a list of plans the requesting user is allowed to see.
+    Visibility:
+    - Unauthenticated, or authenticated-but-not-credit-eligible: OPEN only.
+    - Authenticated + eligible: OPEN plus WORKSPACE_ONLY plans for the
+      workspaces the user is an active member of.
 
-    Supported query parameters (all optional):
-    - ?category=analytics      filter by plan category
-    - ?status=active           filter by plan status
-    - ?workspace=slug          filter by workspace slug
-    - ?search=starter          search in plan name and description
+    Caching: the unauthenticated OPEN list (with no filters) is cached in
+    Redis under PLANS_CACHE_KEY for PLANS_CACHE_TTL. The cache is only used
+    for the anonymous, no-filter path -- authenticated users have a
+    per-user visible set, so serving them the cached anonymous list would
+    leak or hide rows; we simply never read/write the cache for them. When
+    filters are present we bypass the cache rather than mint an unbounded
+    set of per-querystring keys.
 
-    SECURITY REQUIREMENT:
-    All query parameters come from untrusted user input.
-    They must NEVER be interpolated into raw SQL strings.
-    Use Django ORM filters exclusively.
-    Any use of raw(), extra(), or cursor.execute() with string formatting
-    is an automatic fail and a critical security vulnerability.
+    SQL-injection safety: every query parameter is applied through ORM
+    filters (.filter(field=value) / Q objects). Django sends these to the
+    database as bound parameters -- the value travels in the protocol's
+    parameter slot, separate from the SQL text -- so user input is treated
+    strictly as data and can never alter the query structure. There is no
+    raw(), extra(), or cursor.execute() string formatting anywhere here.
 
-    TODO: Add a comment here explaining why ORM filters prevent SQL
-    injection. Be specific: what does Django do with the filter values
-    that makes injection impossible?
-
-    Permission requirements:
-    - Unauthenticated users: see only OPEN plans
-    - Authenticated users without sufficient credits: see only OPEN plans
-    - Authenticated users with sufficient credits: see OPEN plans plus
-      WORKSPACE_ONLY plans for workspaces they are members of
-
-    Caching requirements:
-    - OPEN plan list (unauthenticated path) must be cached in Redis
-    - Cache key: PLANS_CACHE_KEY
-    - TTL: PLANS_CACHE_TTL
-    - Cache must be invalidated when any plan status changes
-    - TODO: Add a comment explaining your cache invalidation strategy
-    - Cached results must NOT be served to authenticated users since
-      their visible set differs. TODO: Add a comment explaining how
-      you handle this without serving stale or over-privileged data.
-
-    Performance requirements:
-    - Must execute in a maximum of 2 database queries for authenticated
-      users:
-        Query 1: fetch plans with workspace and booking_count annotation
-        Query 2: fetch user's active workspace memberships (if
-                 authenticated and eligible)
-    - Zero N+1 queries. Prove it in a comment.
-
-    TODO: Implement this view.
+    Query budget (authenticated, eligible):
+      Query 1: plans, with workspace select_related + booking_count
+               annotation (one COUNT folded into the same SELECT).
+      Query 2: the user's active workspace memberships.
+    The Layer-2 eligibility check is one additional constant-time aggregate
+    (get_available_credit_balance) -- it does not grow with the result set,
+    so it is not an N+1; the per-plan data path stays at 2 queries.
     """
+
     permission_classes = [AllowAny]
 
+    FILTER_PARAMS = ("category", "status", "workspace", "search")
+
     def get(self, request):
-        raise NotImplementedError("TODO: implement PlanListView.get")
+        user = request.user
+        params = request.query_params
+        is_auth = bool(user and user.is_authenticated)
+        has_filters = any(params.get(k) for k in self.FILTER_PARAMS)
+
+        # Anonymous + unfiltered -> try Redis first.
+        use_cache = (not is_auth) and (not has_filters)
+        if use_cache:
+            cached = cache.get(PLANS_CACHE_KEY)
+            if cached is not None:
+                return Response(cached)
+
+        base = (
+            Plan.objects
+            .select_related("workspace")
+            .annotate(
+                booking_count=Count(
+                    "bookings",
+                    filter=Q(bookings__status=Booking.BookingStatus.CONFIRMED),
+                )
+            )
+        )
+        base = self._apply_filters(base, params)
+
+        eligible = False
+        member_workspace_ids = []
+        if is_auth:
+            eligible = get_available_credit_balance(user, workspace=None) > 0
+            if eligible:
+                now = timezone.now()
+                member_workspace_ids = list(
+                    WorkspaceMembership.objects
+                    .filter(
+                        user=user,
+                        status=WorkspaceMembership.Status.ACTIVE,
+                    )
+                    .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+                    .values_list("workspace_id", flat=True)
+                )
+
+        if is_auth and eligible:
+            visibility = Q(visibility=Plan.Visibility.OPEN) | Q(
+                visibility=Plan.Visibility.WORKSPACE_ONLY,
+                workspace_id__in=member_workspace_ids,
+            )
+        else:
+            visibility = Q(visibility=Plan.Visibility.OPEN)
+
+        plans = base.filter(visibility).order_by("id")
+        data = PlanSerializer(plans, many=True).data
+
+        if use_cache:
+            cache.set(PLANS_CACHE_KEY, data, PLANS_CACHE_TTL)
+
+        return Response(data)
+
+    def _apply_filters(self, qs, params):
+        category = params.get("category")
+        status_param = params.get("status")
+        workspace = params.get("workspace")
+        search = params.get("search")
+
+        if category:
+            qs = qs.filter(category=category)
+        if status_param:
+            qs = qs.filter(status=status_param)
+        if workspace:
+            qs = qs.filter(workspace__slug=workspace)
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        return qs
 
 
 class PlanBookView(APIView):
     """
     POST /api/plans/{id}/book/
 
-    Book an Action under the specified plan, consuming credits from the
-    authenticated user's balance.
+    Layer 1 (IsAuthenticated) and Layer 2 (HasSufficientCredits) are
+    enforced by permission_classes. Layer 3 (plan accessibility) is checked
+    in the body: OPEN is bookable by any eligible user; WORKSPACE_ONLY
+    requires an active membership of the plan's workspace.
 
-    Permission requirements (ALL THREE must pass):
-    Layer 1: User must be authenticated (JWT)
-    Layer 2: User must have a sufficient available credit balance
-             - Check platform subscription grants first
-             - Then check workspace-scoped top-up grants
-             - Balance is computed from the ledger, not a stored field
-    Layer 3: Plan must be accessible to this user
-             - OPEN: any user with sufficient credits can book
-             - WORKSPACE_ONLY: user must be an active member of the
-               plan's workspace
+    Atomicity: the Booking row and its consuming LedgerEntry are written in
+    ONE transaction. If they were not atomic, a crash between them would
+    either (a) deduct credits with no booking, or (b) create a booking that
+    the ledger never accounts for -- in both cases the ledger-derived
+    balance diverges from reality, which is a financial-integrity failure in
+    a system whose entire balance model is "trust the ledger".
 
-    Booking rules:
-    - Plan must be in ACTIVE status
-    - Plan must not be at capacity
-    - credits_consumed must be set to plan.credit_cost at booking time,
-      never taken from the request body
+    Kafka publish is OUTSIDE the transaction (after commit). If we published
+    inside and the transaction then rolled back, we would have emitted a
+    "credits consumed" event for a booking that does not exist -- consumers
+    (billing, analytics) would act on a phantom. Publishing only after a
+    successful commit guarantees we never announce work we didn't durably do.
 
-    Atomicity requirement:
-    - Booking creation and LedgerEntry creation must be ATOMIC
-    - If LedgerEntry write fails, Booking must roll back
-    - If Booking creation fails, LedgerEntry must not be written
-    - TODO: Add a comment explaining why atomicity matters here.
-      What is the failure mode if they are not atomic?
-
-    Kafka requirement:
-    - After successful booking, publish to Kafka via
-      publish_credit_consumed()
-    - Kafka publish must be OUTSIDE the atomic transaction
-    - TODO: Add a comment explaining why Kafka publish must be outside
-      the transaction. What happens if you publish inside and the
-      transaction rolls back?
-
-    TODO: Implement this view.
+    Concurrency: we lock the plan row (capacity) and the user row (spend)
+    with select_for_update, in a fixed order (plan, then user) to avoid
+    deadlocks. This serializes two simultaneous bookings that would
+    otherwise both read "enough balance / under capacity" and double-spend.
     """
+
     permission_classes = [IsAuthenticated, HasSufficientCredits]
 
     def post(self, request, plan_id):
-        raise NotImplementedError("TODO: implement PlanBookView.post")
+        user = request.user
+        plan = get_object_or_404(
+            Plan.objects.select_related("workspace"), pk=plan_id
+        )
+        workspace = plan.workspace
+
+        # Layer 3 -- accessibility.
+        if plan.visibility == Plan.Visibility.WORKSPACE_ONLY:
+            if get_active_membership(user, workspace) is None:
+                raise PermissionDenied(
+                    "You are not an active member of this plan's workspace."
+                )
+
+        # Declarative validation (status + capacity) for a clean 400.
+        serializer = BookingSerializer(
+            data={"plan": plan.pk}, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            # Fixed lock order: plan first, then user.
+            locked_plan = Plan.objects.select_for_update().get(pk=plan.pk)
+            UserAccount.objects.select_for_update().get(pk=user.pk)
+
+            if locked_plan.status != Plan.Status.ACTIVE:
+                raise ValidationError("Plan is not in ACTIVE status.")
+
+            if locked_plan.capacity is not None:
+                confirmed = Booking.objects.filter(
+                    plan=locked_plan,
+                    status=Booking.BookingStatus.CONFIRMED,
+                ).count()
+                if confirmed >= locked_plan.capacity:
+                    raise Conflict("Plan is at capacity.")
+
+            balance = get_available_credit_balance(user, workspace=workspace)
+            cost = locked_plan.credit_cost
+            if balance < cost:
+                raise ValidationError(
+                    "Insufficient credit balance for this plan."
+                )
+
+            try:
+                booking = Booking.objects.create(
+                    plan=locked_plan,
+                    user=user,
+                    status=Booking.BookingStatus.CONFIRMED,
+                    # Snapshot of the plan cost, decided server-side.
+                    credits_consumed=cost,
+                )
+            except IntegrityError:
+                # unique_together (plan, user): already booked.
+                raise ValidationError("You have already booked this plan.")
+
+            LedgerEntry.objects.create(
+                entry_type="consumed",
+                acting_user=user,
+                acting_context="subscriber",
+                subject_user=user,
+                object_type="booking",
+                object_id=booking.pk,
+                amount=-cost,  # negative: consumption
+                previous_balance=balance,
+                resulting_balance=balance - cost,
+                reason_code="",
+            )
+
+        # --- committed; safe to announce ---
+        publish_credit_consumed(
+            {
+                "booking_id": booking.pk,
+                "plan_id": locked_plan.pk,
+                "user_id": user.pk,
+                "workspace_id": workspace.pk,
+                "credits_consumed": cost,
+                "status": booking.status,
+                "booked_at": booking.booked_at.isoformat(),
+            }
+        )
+
+        return Response(
+            BookingSerializer(booking).data, status=status.HTTP_201_CREATED
+        )
 
 
 class PlanGrantView(APIView):
     """
     PATCH /api/plans/{id}/grant/
 
-    Issue a credit top-up grant to a specified user under this plan's
-    workspace.
+    Layer 1 + Layer 2 via permission_classes. Layer 3 (must be the
+    administrator of THIS plan's workspace) is an object-level check; APIView
+    does not run object permissions automatically, so we invoke
+    self.check_object_permissions(request, plan) explicitly against the
+    concrete plan.
 
-    Permission requirements (ALL THREE must pass):
-    Layer 1: User must be authenticated (JWT)
-    Layer 2: User must have a sufficient available credit balance
-    Layer 3: User must be the Administrator of this plan's workspace
-             (ScopedRole: role_type=administrator,
-              scope_object_type=workspace,
-              scope_object_id=plan.workspace.pk)
-
-    Grant rules:
-    - target_user_id must refer to an existing, active UserAccount
-    - amount must be a positive integer
-    - CreditGrant record creation and LedgerEntry must be atomic
-    - previous_balance and resulting_balance must be recorded in
-      LedgerEntry
-
-    Cache invalidation:
-    - Must invalidate PLANS_CACHE_KEY after a successful grant if the
-      grant affects plan visibility for the target user
-
-    TODO: Implement this view.
+    The CreditGrant and its LedgerEntry are written atomically for the same
+    integrity reason as booking: a grant the ledger never recorded (or a
+    ledger entry with no grant) corrupts the derived balance. We lock the
+    TARGET user row so concurrent grants/spends compute previous/resulting
+    balance against a stable view. Kafka publish is after commit, outside
+    the transaction.
     """
-    permission_classes = [IsAuthenticated, HasSufficientCredits, IsWorkspaceAdministrator]
+
+    permission_classes = [
+        IsAuthenticated,
+        HasSufficientCredits,
+        IsWorkspaceAdministrator,
+    ]
 
     def patch(self, request, plan_id):
-        raise NotImplementedError("TODO: implement PlanGrantView.patch")
+        actor = request.user
+        plan = get_object_or_404(
+            Plan.objects.select_related("workspace"), pk=plan_id
+        )
+        # Layer 3 -- triggers IsWorkspaceAdministrator.has_object_permission.
+        self.check_object_permissions(request, plan)
+
+        serializer = CreditGrantSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        vd = serializer.validated_data
+
+        workspace = plan.workspace
+        amount = vd["amount"]
+        target_id = vd["target_user_id"]
+
+        with transaction.atomic():
+            try:
+                target = (
+                    UserAccount.objects
+                    .select_for_update()
+                    .get(pk=target_id, is_active=True)
+                )
+            except UserAccount.DoesNotExist:
+                raise ValidationError(
+                    "target_user_id must refer to an existing, active user."
+                )
+
+            previous = get_available_credit_balance(target, workspace=workspace)
+
+            grant = CreditGrant.objects.create(
+                user=target,
+                workspace=workspace,
+                source=CreditGrant.Source.TOPUP,
+                amount=amount,
+                expires_at=vd.get("expires_at"),
+                is_active=True,
+            )
+
+            resulting = previous + amount
+            LedgerEntry.objects.create(
+                entry_type="grant.topup",
+                acting_user=actor,  # the administrator, from request.user
+                acting_context="workspace_admin",
+                subject_user=target,
+                object_type="credit_grant",
+                object_id=grant.pk,
+                amount=amount,  # positive: grant
+                previous_balance=previous,
+                resulting_balance=resulting,
+                reason_code=vd.get("reason_code") or "",
+            )
+
+        # A top-up can make the target eligible to see WORKSPACE_ONLY plans,
+        # so we conservatively drop the public cache after a successful grant.
+        invalidate_plans_cache()
+
+        # --- committed; safe to announce ---
+        publish_credit_granted(
+            {
+                "grant_id": grant.pk,
+                "user_id": target.pk,
+                "workspace_id": workspace.pk,
+                "acting_user_id": actor.pk,
+                "source": grant.source,
+                "amount": amount,
+                "granted_at": grant.granted_at.isoformat(),
+            }
+        )
+
+        return Response(
+            {
+                "grant_id": grant.pk,
+                "target_user_id": target.pk,
+                "workspace_id": workspace.pk,
+                "amount": amount,
+                "previous_balance": previous,
+                "resulting_balance": resulting,
+            },
+            status=status.HTTP_201_CREATED,
+        )

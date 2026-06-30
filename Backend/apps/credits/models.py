@@ -97,9 +97,21 @@ class Plan(models.Model):
     class Meta:
         db_table = "plans"
         indexes = [
-            # TODO: Candidate must add indexes here and justify each one
-            # in a comment. Think about what queries will run most
-            # frequently at scale.
+            # Hottest path: the public plan list filters on
+            # visibility + status (OPEN + ACTIVE) on every anonymous read.
+            # Composite serves that WHERE directly.
+            models.Index(
+                fields=["visibility", "status"],
+                name="plan_visibility_status_idx",
+            ),
+            # Workspace-scoped listing (WORKSPACE_ONLY plans for a member)
+            # and admin management both filter by workspace + status.
+            models.Index(
+                fields=["workspace", "status"],
+                name="plan_workspace_status_idx",
+            ),
+            # Supports the optional ?category= filter on the list endpoint.
+            models.Index(fields=["category"], name="plan_category_idx"),
         ]
 
     def __str__(self):
@@ -166,9 +178,20 @@ class Booking(models.Model):
         db_table = "bookings"
         unique_together = [("plan", "user")]
         indexes = [
-            # TODO: Candidate must add indexes here and justify each one
-            # in a comment.
+            # Capacity enforcement and the booking_count annotation both do
+            # COUNT(confirmed bookings) per plan. (plan, status) lets that
+            # count be served from the index without touching table rows.
+            models.Index(
+                fields=["plan", "status"], name="booking_plan_status_idx"
+            ),
+            # "My bookings" / per-user status lookups.
+            models.Index(
+                fields=["user", "status"], name="booking_user_status_idx"
+            ),
         ]
+        # NOTE: unique_together already creates the (plan, user) index that
+        # backs the "already booked?" uniqueness check, so it is not
+        # duplicated above.
 
     def __str__(self):
         return f"{self.user.email} -> {self.plan.name} ({self.credits_consumed} credits)"
